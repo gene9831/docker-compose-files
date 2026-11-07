@@ -1,0 +1,24 @@
+services:
+  terraria:
+    build: .
+    platform: linux/amd64
+    user: "${PUID:-1000}:${PGID:-1000}"
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 90s
+    environment:
+      HOME: /data
+      WORLD_FILE: ${WORLD_FILE:-}
+      WORLD_SIZE: ${WORLD_SIZE:-medium}
+      WORLD_DIFFICULTY: ${WORLD_DIFFICULTY:-classic}
+    ports:
+      - host_ip: "${HOST:-127.0.0.1}"
+        published: "${PORT:-7777}"
+        target: 7777
+        protocol: tcp
+    volumes:
+      - type: bind
+        source: ./data
+        target: /data
+        bind:
+          create_host_path: false
