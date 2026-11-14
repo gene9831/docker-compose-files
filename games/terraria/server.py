@@ -1,4 +1,5 @@
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,13 @@ VERSION_URL = "https://terraria.org/api/get/dedicated-servers-names"
 DOWNLOAD_URL = "https://terraria.org/api/download/pc-dedicated-server"
 SERVER_BINARY = "TerrariaServer.bin.x86_64"
 STARTUP_TIMEOUT = 600
+SAVE_TIMEOUT = 120
 SERVER_READY = re.compile(rb"(?:^|[\r\n])(?:: )?Server started[\r\n]")
+# Terraria has written and validated the primary world before rotating its backups.
+SAVE_COMPLETE = re.compile(rb"(?:^|[\r\n])(?:: )?Backing up world file[\r\n]")
+NO_PLAYERS = re.compile(rb"(?:^|[\r\n])(?:: )?No players connected\.[\r\n]")
+PLAYERS_CHECKED = re.compile(rb"(?:^|[\r\n])(?:: )?Terraria Server v[0-9.]+[\r\n]")
+BACKUP_STAMP = r"[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}(?:\.[0-9]+)?"
 WORLD_SIZES = {"small": 1, "medium": 2, "large": 3}
 WORLD_DIFFICULTIES = {"classic": 0, "expert": 1, "master": 2, "journey": 3}
 
@@ -111,21 +118,108 @@ def world_files(world):
     return (world, world.with_suffix(".wld.bak"), world.with_suffix(".wld.bak2"))
 
 
+def backup_settings():
+    values = []
+    for name, default in (("SAVE_INTERVAL_MINUTES", "10"), ("BACKUP_KEEP", "5")):
+        value = os.environ.get(name) or default
+        if not value.isascii() or not value.isdecimal() or int(value) < 1:
+            raise ValueError(f"{name} must be a positive integer")
+        values.append(int(value))
+    minutes, keep = values
+    return minutes * 60, keep
+
+
+def backup_destination(backups, stamp, *, extension=""):
+    sequence = 0
+    for path in backups.glob(f"{stamp}.*{extension}"):
+        suffix = path.name[len(stamp) + 1:].removesuffix(extension)
+        if suffix.isascii() and suffix.isdecimal():
+            sequence = max(sequence, int(suffix))
+    base = backups / f"{stamp}{extension}"
+    if sequence or base.exists() or base.is_symlink():
+        return backups / f"{stamp}.{sequence + 1}{extension}"
+    return base
+
+
+def create_backup(files, backups):
+    backups.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    destination = backup_destination(backups, stamp)
+    with TemporaryDirectory(dir=backups, prefix=".partial-") as temporary:
+        stage = Path(temporary) / destination.name
+        stage.mkdir()
+        for path in files:
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f"Cannot back up a non-regular world file: {path}")
+            shutil.copy2(path, stage / path.name)
+        stage.rename(destination)
+    return destination
+
+
+def migrate_backups(world, backups):
+    old = world.parent.parent / "backups" / "periodic" / world.name
+    backups.mkdir(parents=True, exist_ok=True)
+    if old.is_dir() and not old.is_symlink():
+        for snapshot in sorted(old.iterdir()):
+            if not re.fullmatch(r"[0-9]{8}T[0-9]{12}Z", snapshot.name) or snapshot.is_symlink():
+                continue
+            if not snapshot.is_dir() or not (snapshot / world.name).is_file():
+                continue
+            instant = datetime.strptime(snapshot.name, "%Y%m%dT%H%M%S%fZ").replace(tzinfo=timezone.utc)
+            stamp = instant.astimezone().strftime("%Y-%m-%d_%H-%M")
+            snapshot.rename(backup_destination(backups, stamp))
+        if not any(old.iterdir()):
+            old.rmdir()
+        if not any(old.parent.iterdir()):
+            old.parent.rmdir()
+
+    for snapshot in sorted(backups.iterdir()):
+        if not re.fullmatch(BACKUP_STAMP, snapshot.name) or not snapshot.is_dir() or snapshot.is_symlink():
+            continue
+        source = snapshot / world.name
+        if source.is_symlink() or not source.is_file() or len(list(snapshot.iterdir())) != 1:
+            continue
+        destination = backups / f"{snapshot.name}.wld"
+        if destination.exists() or destination.is_symlink():
+            minute = snapshot.name.partition(".")[0]
+            destination = backup_destination(backups, minute, extension=".wld")
+        source.rename(destination)
+        snapshot.rmdir()
+
+
+def backup_world(world, keep):
+    backups = world.parent.parent / "backups" / f"{world.name}.d"
+    migrate_backups(world, backups)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    destination = backup_destination(backups, stamp, extension=".wld")
+    if world.is_symlink():
+        raise ValueError(f"Cannot back up a non-regular world file: {world}")
+    with TemporaryDirectory(dir=backups, prefix=".partial-") as temporary:
+        stage = Path(temporary) / world.name
+        shutil.copy2(world, stage)
+        stage.rename(destination)
+    snapshots = sorted(
+        (path for path in backups.iterdir()
+         if re.fullmatch(BACKUP_STAMP + r"\.wld", path.name)
+         and path.is_file() and not path.is_symlink()),
+        key=lambda path: (path.stem.partition(".")[0], int(path.stem.partition(".")[2] or 0)),
+    )
+    for snapshot in snapshots[:-keep]:
+        snapshot.unlink()
+    print(f"World backup saved: {destination}", flush=True)
+    return destination
+
+
+def world_digest(world):
+    with world.open("rb") as file:
+        return hashlib.file_digest(file, "sha256").digest()
+
+
 def begin_trial(data, world, pending, version):
     files = [path for path in world_files(world) if path.exists() or path.is_symlink()]
     backup_name = None
     if files:
-        backups = data / "backups"
-        backups.mkdir(exist_ok=True)
-        backup_name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-        with TemporaryDirectory(dir=backups, prefix=".partial-") as temporary:
-            stage = Path(temporary) / backup_name
-            stage.mkdir()
-            for path in files:
-                if path.is_symlink() or not path.is_file():
-                    raise ValueError(f"Cannot back up a non-regular world file: {path}")
-                shutil.copy2(path, stage / path.name)
-            stage.rename(backups / backup_name)
+        backup_name = create_backup(files, data / "backups").name
 
     trial = {"version": version, "world": world.name, "backup": backup_name, "files": [path.name for path in files]}
     with TemporaryDirectory(dir=pending.parent) as temporary:
@@ -165,15 +259,40 @@ def activate_candidate(current, pending, version):
     print(f"Activated Terraria {version}", flush=True)
 
 
-def wait_for_candidate(child, stopping, on_ready):
+def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep):
     deadline = monotonic() + STARTUP_TIMEOUT
     ready = False
     tail = b""
+    next_save = None
+    saving_until = None
+    checking_players = False
+    players_absent = False
+    last_backup_digest = None
     timeout_error = "Terraria did not report readiness before the startup timeout"
     while True:
-        timeout = None if ready or stopping() else deadline - monotonic()
-        if timeout is not None and timeout <= 0:
+        now = monotonic()
+        if not ready and on_ready is not None and not stopping() and now >= deadline:
             raise TimeoutError(timeout_error)
+        if not stopping() and next_save is not None and now >= next_save:
+            # version is a response boundary after the complete playing result.
+            child.stdin.write(b"playing\nversion\n")
+            child.stdin.flush()
+            next_save = None
+            saving_until = now + SAVE_TIMEOUT
+            checking_players = True
+            players_absent = False
+            tail = b""
+        if saving_until is not None and now >= saving_until:
+            print("Scheduled backup response was not confirmed. Skipping this backup.", file=sys.stderr)
+            saving_until = None
+            checking_players = False
+            next_save = now + save_interval
+        deadlines = []
+        if not stopping():
+            if not ready and on_ready is not None:
+                deadlines.append(deadline)
+            deadlines.extend(value for value in (next_save, saving_until) if value is not None)
+        timeout = max(0, min(deadlines) - monotonic()) if deadlines else None
         if not select.select([child.stdout], [], [], timeout)[0]:
             continue
         chunk = os.read(child.stdout.fileno(), 65536)
@@ -181,18 +300,50 @@ def wait_for_candidate(child, stopping, on_ready):
             break
         sys.stdout.buffer.write(chunk)
         sys.stdout.buffer.flush()
+        output = tail + chunk
         if not ready and not stopping():
-            output = tail + chunk
             if SERVER_READY.search(output) and child.poll() is None:
-                on_ready()
+                if on_ready is not None:
+                    on_ready()
                 ready = True
-            tail = output[-64:]
-    if not ready and not stopping():
+                if world is not None:
+                    last_backup_digest = world_digest(world)
+                    next_save = monotonic() + save_interval
+        if saving_until is not None and checking_players and not stopping():
+            players_absent = players_absent or NO_PLAYERS.search(output) is not None
+            if PLAYERS_CHECKED.search(output):
+                checking_players = False
+                try:
+                    needs_save = not players_absent or world_digest(world) != last_backup_digest
+                except OSError as error:
+                    print(f"Cannot inspect world for scheduled backup: {error}", file=sys.stderr)
+                    needs_save = False
+                if needs_save:
+                    child.stdin.write(b"save\n")
+                    child.stdin.flush()
+                    saving_until = monotonic() + SAVE_TIMEOUT
+                    print(f"Requested scheduled world save: {world.name}", flush=True)
+                    # Discard pre-request output, including native autosaves.
+                    tail = b""
+                    continue
+                saving_until = None
+                next_save = monotonic() + save_interval
+                print(f"Skipped backup of unchanged empty world: {world.name}", flush=True)
+        if saving_until is not None and not checking_players and not stopping() and SAVE_COMPLETE.search(output):
+            try:
+                destination = backup_world(world, backup_keep)
+                last_backup_digest = world_digest(destination)
+            except (OSError, ValueError) as error:
+                print(f"Scheduled world backup failed: {error}", file=sys.stderr)
+            saving_until = None
+            next_save = monotonic() + save_interval
+        tail = output[-128:]
+    if not ready and on_ready is not None and not stopping():
         raise RuntimeError("Terraria closed its console before reporting readiness")
     return child.wait()
 
 
-def run_server(binary, config, *, on_ready=None):
+def run_server(binary, config, *, on_ready=None, world=None, save_interval=600, backup_keep=5):
     process = None
     stopping = False
 
@@ -220,32 +371,30 @@ def run_server(binary, config, *, on_ready=None):
                 [str(binary), "-config", str(settings)],
                 cwd=binary.parent,
                 stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE if on_ready is not None else None,
+                stdout=subprocess.PIPE,
             ) as child:
                 process = child
                 if stopping:
                     stopping = False
                     stop_server()
-                if on_ready is not None:
-                    try:
-                        return wait_for_candidate(child, lambda: stopping, on_ready)
-                    finally:
-                        if child.poll() is None:
-                            child.kill()
-                return child.wait()
+                try:
+                    return monitor_server(child, lambda: stopping, on_ready, world, save_interval, backup_keep)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
     finally:
         signal.signal(signal.SIGTERM, previous_term)
         signal.signal(signal.SIGINT, previous_int)
 
 
-def run_cached(active, config, error):
+def run_cached(active, config, error, world, save_interval, backup_keep):
     if not active.is_file():
         raise RuntimeError(f"Cannot install Terraria and no cached server is available: {error}") from error
     print(f"Terraria update failed ({error}). Using cached release {active.parent.name}.", file=sys.stderr)
-    return run_server(active, config)
+    return run_server(active, config, world=world, save_interval=save_interval, backup_keep=backup_keep)
 
 
-def serve(data, world, config, current, pending):
+def serve(data, world, config, current, pending, save_interval, backup_keep):
     active = current.resolve() / SERVER_BINARY
     try:
         candidate = install_candidate(current.parent)
@@ -253,25 +402,30 @@ def serve(data, world, config, current, pending):
             begin_trial(data, world, pending, candidate.parent.name)
     except (OSError, ValueError, HTTPException) as error:
         recover_trial(data, current, pending)
-        return run_cached(active, config, error)
+        return run_cached(active, config, error, world, save_interval, backup_keep)
     if candidate == active:
         print(f"Terraria {active.parent.name} is already installed", flush=True)
-        return run_server(active, config)
+        return run_server(active, config, world=world, save_interval=save_interval, backup_keep=backup_keep)
 
     try:
-        result = run_server(candidate, config, on_ready=lambda: activate_candidate(current, pending, candidate.parent.name))
+        result = run_server(
+            candidate, config,
+            on_ready=lambda: activate_candidate(current, pending, candidate.parent.name),
+            world=world, save_interval=save_interval, backup_keep=backup_keep,
+        )
     except (OSError, RuntimeError) as error:
         if current.resolve() == candidate.parent:
             raise
         recover_trial(data, current, pending)
         # The previous world may have been absent, so retain its original creation config.
-        return run_cached(active, config, error)
+        return run_cached(active, config, error, world, save_interval, backup_keep)
     recover_trial(data, current, pending)
     return result
 
 
 def main():
     data = Path("/data")
+    save_interval, backup_keep = backup_settings()
     with (data / ".terraria.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -289,7 +443,7 @@ def main():
             size=os.environ.get("WORLD_SIZE") or "medium",
             difficulty=os.environ.get("WORLD_DIFFICULTY") or "classic",
         )
-        return serve(data, world, config, current, pending)
+        return serve(data, world, config, current, pending, save_interval, backup_keep)
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ services:
       WORLD_FILE: ${WORLD_FILE:-}
       WORLD_SIZE: ${WORLD_SIZE:-medium}
       WORLD_DIFFICULTY: ${WORLD_DIFFICULTY:-classic}
+      SAVE_INTERVAL_MINUTES: ${SAVE_INTERVAL_MINUTES:-10}
+      BACKUP_KEEP: ${BACKUP_KEEP:-5}
     ports:
       - host_ip: "${HOST:-127.0.0.1}"
         published: "${PORT:-7777}"
@@ -20,5 +22,11 @@ services:
       - type: bind
         source: ./data
         target: /data
+        bind:
+          create_host_path: false
+      - type: bind
+        source: /etc/localtime
+        target: /etc/localtime
+        read_only: true
         bind:
           create_host_path: false

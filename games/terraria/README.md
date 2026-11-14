@@ -26,6 +26,8 @@ docker compose logs -f terraria
 | `WORLD_FILE` | 空 | 已有 `.wld` 文件名。留空时使用 `default.wld` |
 | `WORLD_SIZE` | `medium` | 首次生成世界的大小，可选 `small`、`medium`、`large` |
 | `WORLD_DIFFICULTY` | `classic` | 首次生成世界的难度，可选 `classic`、`expert`、`master`、`journey` |
+| `SAVE_INTERVAL_MINUTES` | `10` | 定时保存并备份的间隔，单位分钟，正整数 |
+| `BACKUP_KEEP` | `5` | 每个世界保留的定时快照数量，正整数 |
 
 `./data` 是宿主机上的数据目录。修改 UID/GID 或迁移已有数据前，确认新的运行账号能够读写目录和其中的文件。修改 `.env` 后，运行 `docker compose config --quiet` 检查配置，再执行 `docker compose up -d` 应用。
 
@@ -43,6 +45,18 @@ WORLD_FILE='我的世界.wld'
 
 执行 `docker compose up -d` 应用新的存档配置。指定的存档缺失时，服务会报错并退出。
 
+## 定时保存和备份
+
+服务器就绪后每隔 `SAVE_INTERVAL_MINUTES` 分钟查询在线玩家。有人在线时发送 `save`；空服时比较当前存档与上次快照，只有本次运行期间产生了尚未备份的新存档才补一份快照。原版空服会休眠，存档没有变化时跳过保存和备份，保留已有历史。
+
+发送 `save` 后，等待原版服务端写入、校验主存档并报告进入备份阶段，再复制当前 `.wld`。查询或保存的完成标记超过 2 分钟未出现时，会跳过当次快照并记录日志。
+
+定时快照直接存放在 `data/backups/<世界文件名>.d/YYYY-MM-DD_HH-mm.wld`，例如 `data/backups/我的世界.wld.d/2026-11-15_00-30.wld`。容器只读挂载宿主机的 `/etc/localtime`，按系统时区生成精确到分钟的文件名。同一分钟有多份备份时，使用 `2026-11-15_00-30.1.wld`、`2026-11-15_00-30.2.wld` 等名称。
+
+新快照完整写入后，清理该世界超出 `BACKUP_KEEP` 的旧快照。默认每 10 分钟一次，保留最近 5 份。不同世界独立轮换，升级前备份单独保留。该世界下次生成定时快照时，会兼容迁移旧 `periodic/<世界文件名>/` 和嵌套的时间戳目录。旧 UTC 时间戳转换为系统时区。手动备份目录 `data/worlds.bak/` 独立保留。
+
+恢复前先停止服务，并保留当前世界文件。将选中的历史 `.wld` 复制到 `data/worlds/` 下的新文件名，再通过 `.env` 的 `WORLD_FILE` 指定该文件并启动。快照包含世界地图和箱子等世界数据，角色背包与装备由客户端保存。
+
 ## 更新和停止
 
 每次容器启动时检查 Terraria 官网公布的 PC 专用服务端版本。运行 `docker compose restart terraria` 可以立即触发检查。同一版本直接复用。试启动新版前，先将当前世界及其现有回滚文件完整备份到 `data/backups/`，等新版报告 `Server started` 后再将它设为当前版本。
@@ -55,4 +69,4 @@ WORLD_FILE='我的世界.wld'
 
 ## 回归测试
 
-在此目录运行 `python3 -m unittest -v`，验证更新回退、备份和存档路径约束。测试使用临时目录和替代进程。
+在此目录运行 `python3 -m unittest -v`，验证更新回退、定时保存、快照轮换和存档路径约束。测试使用临时目录和替代进程。
