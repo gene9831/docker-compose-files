@@ -362,6 +362,68 @@ class ServerTest(unittest.TestCase):
         snapshot, = root.glob("*.wld")
         self.assertEqual(snapshot.read_bytes(), b"final scheduled save")
 
+    def test_consecutive_empty_skips_log_once_and_reset_after_saving(self):
+        binary = self.executable(
+            "1457",
+            "import sys, time\n"
+            "print(': Server started', flush=True)\n"
+            "checks = 0\n"
+            "for command in sys.stdin:\n"
+            "    if command.strip() == 'playing':\n"
+            "        checks += 1\n"
+            "        response = '1 players connected.' if checks == 4 else 'No players connected.'\n"
+            "        for byte in (response + '\\r\\n').encode():\n"
+            "            sys.stdout.buffer.write(bytes([byte]))\n"
+            "            sys.stdout.buffer.flush()\n"
+            "            time.sleep(0.0001)\n"
+            "        if checks == 2:\n"
+            "            print('Unrelated server message', flush=True)\n"
+            "    elif command.strip() == 'version':\n"
+            "        print(': Terraria Server v1.4.5.8', flush=True)\n"
+            "        if checks == 6:\n"
+            "            break\n"
+            "    elif command.strip() == 'save':\n"
+            f"        Path({str(self.world)!r}).write_bytes(b'new scheduled save')\n"
+            "        print('Backing up world file', flush=True)",
+        )
+        output = io.BytesIO()
+        with patch.object(server.sys, "stdout", io.TextIOWrapper(output, write_through=True)):
+            self.assertEqual(server.run_server(binary, "", world=self.world, save_interval=0.05), 0)
+            logged = output.getvalue().decode()
+        self.assertEqual(logged.count("Skipped backup of unchanged empty world:"), 2)
+        self.assertEqual(logged.count("No players connected."), 2)
+        self.assertEqual(logged.count("Terraria Server v1.4.5.8"), 3)
+        self.assertIn("Unrelated server message", logged)
+        self.assertEqual(logged.count("Requested scheduled world save:"), 1)
+        snapshot, = (self.data / "backups" / f"{self.world.name}.d").glob("*.wld")
+        self.assertEqual(snapshot.read_bytes(), b"new scheduled save")
+
+    def test_query_timeout_and_eof_preserve_unrelated_server_output(self):
+        binary = self.executable(
+            "1457",
+            "import sys\n"
+            "print(': Server started', flush=True)\n"
+            "checks = 0\n"
+            "for command in sys.stdin:\n"
+            "    if command.strip() == 'playing':\n"
+            "        checks += 1\n"
+            "        print('No players connected.', flush=True)\n"
+            "        print('World load diagnostic', flush=True)\n"
+            "        if checks == 2:\n"
+            "            break",
+        )
+        output = io.BytesIO()
+        errors = io.StringIO()
+        with (
+            patch.object(server, "SAVE_TIMEOUT", 0.05),
+            patch.object(server.sys, "stdout", io.TextIOWrapper(output, write_through=True)),
+            patch.object(server.sys, "stderr", errors),
+        ):
+            self.assertEqual(server.run_server(binary, "", world=self.world, save_interval=0.05), 0)
+            logged = output.getvalue().decode()
+        self.assertEqual(logged.count("World load diagnostic"), 2)
+        self.assertIn("Scheduled backup response was not confirmed", errors.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

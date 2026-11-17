@@ -259,6 +259,18 @@ def activate_candidate(current, pending, version):
     print(f"Activated Terraria {version}", flush=True)
 
 
+def write_server_output(output, *, quiet_query=False):
+    if quiet_query:
+        output = b"".join(
+            line for line in output.splitlines(keepends=True)
+            if not NO_PLAYERS.search(line) and not PLAYERS_CHECKED.search(line)
+            and line.strip(b": \t\r\n")
+        )
+    if output:
+        sys.stdout.buffer.write(output)
+        sys.stdout.buffer.flush()
+
+
 def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep):
     deadline = monotonic() + STARTUP_TIMEOUT
     ready = False
@@ -268,6 +280,8 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
     checking_players = False
     players_absent = False
     last_backup_digest = None
+    last_skipped = False
+    query_output = b""
     timeout_error = "Terraria did not report readiness before the startup timeout"
     while True:
         now = monotonic()
@@ -281,8 +295,12 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
             saving_until = now + SAVE_TIMEOUT
             checking_players = True
             players_absent = False
+            query_output = b""
             tail = b""
         if saving_until is not None and now >= saving_until:
+            write_server_output(query_output)
+            query_output = b""
+            last_skipped = False
             print("Scheduled backup response was not confirmed. Skipping this backup.", file=sys.stderr)
             saving_until = None
             checking_players = False
@@ -298,8 +316,10 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
         chunk = os.read(child.stdout.fileno(), 65536)
         if not chunk:
             break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
+        if checking_players:
+            query_output += chunk
+        else:
+            write_server_output(chunk)
         output = tail + chunk
         if not ready and not stopping():
             if SERVER_READY.search(output) and child.poll() is None:
@@ -317,8 +337,12 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
                     needs_save = not players_absent or world_digest(world) != last_backup_digest
                 except OSError as error:
                     print(f"Cannot inspect world for scheduled backup: {error}", file=sys.stderr)
+                    last_skipped = False
                     needs_save = False
                 if needs_save:
+                    write_server_output(query_output)
+                    query_output = b""
+                    last_skipped = False
                     child.stdin.write(b"save\n")
                     child.stdin.flush()
                     saving_until = monotonic() + SAVE_TIMEOUT
@@ -328,7 +352,11 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
                     continue
                 saving_until = None
                 next_save = monotonic() + save_interval
-                print(f"Skipped backup of unchanged empty world: {world.name}", flush=True)
+                write_server_output(query_output, quiet_query=last_skipped)
+                query_output = b""
+                if not last_skipped:
+                    print(f"Skipped backup of unchanged empty world: {world.name}", flush=True)
+                last_skipped = True
         if saving_until is not None and not checking_players and not stopping() and SAVE_COMPLETE.search(output):
             try:
                 destination = backup_world(world, backup_keep)
@@ -338,6 +366,7 @@ def monitor_server(child, stopping, on_ready, world, save_interval, backup_keep)
             saving_until = None
             next_save = monotonic() + save_interval
         tail = output[-128:]
+    write_server_output(query_output)
     if not ready and on_ready is not None and not stopping():
         raise RuntimeError("Terraria closed its console before reporting readiness")
     return child.wait()
