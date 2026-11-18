@@ -2,6 +2,8 @@
 
 此目录是独立的 Docker Compose 项目，目标环境为 Linux x86-64。使用 Docker Compose 在目标主机的部署目录运行。
 
+预构建镜像为 `ghcr.io/gene9831/terraria`，公开镜像可直接拉取，无需登录 GHCR。`latest` 对应 `main` 最近一次成功发布，也可用 `sha-<完整提交哈希>` 固定启动程序的构建版本。Terraria 服务端本体在容器启动时下载并缓存到数据目录。
+
 ## 启动
 
 进入 `docker-compose.yaml` 所在目录。若当前账号的 UID/GID 为 `1000:1000`，可以直接执行以下命令。
@@ -9,7 +11,8 @@
 ```sh
 install -d -m 0750 data data/worlds
 test -f .env || cp .env.example .env
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose logs -f terraria
 ```
 
@@ -19,6 +22,7 @@ docker compose logs -f terraria
 
 | 变量 | 默认值 | 用途 |
 | --- | --- | --- |
+| `IMAGE` | `ghcr.io/gene9831/terraria:latest` | 镜像地址和标签，可改为固定构建或其他镜像源 |
 | `HOST` | `127.0.0.1` | 宿主机端口绑定地址 |
 | `PORT` | `7777` | 宿主机 TCP 端口，容器内使用 `7777` |
 | `PUID` | `1000` | 容器运行 UID |
@@ -61,7 +65,16 @@ WORLD_FILE='我的世界.wld'
 
 ## 更新和停止
 
+更新容器镜像时执行以下命令，Compose 会让旧容器正常保存退出后切换到新镜像，保留 `.env` 和 `data/`。需要固定构建版本时，先修改 `.env` 中的 `IMAGE`，再执行相同命令。
+
+```sh
+docker compose pull
+docker compose up -d
+```
+
 每次容器启动时检查 Terraria 官网公布的 PC 专用服务端版本。运行 `docker compose restart terraria` 可以立即触发检查。同一版本直接复用。试启动新版前，先将当前世界及其现有回滚文件完整备份到 `data/backups/`，等新版报告 `Server started` 后再将它设为当前版本。
+
+镜像标签固定的是启动程序与运行环境，服务端版本仍由启动时的更新检查决定。
 
 检查、安装或试启动失败时，使用上次成功启用的版本。新版在 10 分钟内未就绪视为试启动失败。试启动失败或在就绪前中断时，先恢复升级前的世界文件，再继续启动。首次启动需要能访问 Terraria 官网。
 
@@ -72,3 +85,5 @@ WORLD_FILE='我的世界.wld'
 ## 回归测试
 
 在此目录运行 `python3 -m unittest -v`，验证更新回退、定时保存、快照轮换和存档路径约束。测试使用临时目录和替代进程。
+
+GitHub Actions 对本目录或 Terraria 工作流的 PR 改动验证 Compose 配置、构建 Linux amd64 镜像，并在镜像中运行回归测试。相关改动推送到 `main` 后，测试通过才向 GHCR 发布 `latest` 和提交哈希标签；也可从 Actions 页面手动触发。发布使用工作流自带的 `GITHUB_TOKEN`，无需额外配置凭据。工作流不执行服务器部署。

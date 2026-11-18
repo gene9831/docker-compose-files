@@ -1,6 +1,6 @@
 services:
   terraria:
-    build: .
+    image: ${IMAGE:-ghcr.io/gene9831/terraria:latest}
     platform: linux/amd64
     user: "${PUID:-1000}:${PGID:-1000}"
     init: true

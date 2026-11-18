@@ -1,5 +1,7 @@
 FROM python:3.13-slim-bookworm
 
+LABEL org.opencontainers.image.source="https://github.com/gene9831/docker-compose-files"
+
 ENV PYTHONUNBUFFERED=1 \
     MONO_IOMAP=all
 RUN groupadd --gid 1000 terraria \
